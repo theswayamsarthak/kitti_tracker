@@ -287,6 +287,7 @@ class TrackingVideoWriter:
             "ffmpeg", "-y",
             "-framerate", str(self.fps),
             "-i", str(self._tmp_dir / "frame_%06d.jpg"),
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",  # force even dims — libx264 requires this; KITTI's 375px height is odd
             "-vcodec", "libx264",
             "-pix_fmt", "yuv420p",     # required for broad browser/player support
             "-movflags", "+faststart", # allows playback to start before full download
