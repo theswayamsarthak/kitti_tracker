@@ -1,0 +1,29 @@
+# Core ML / Detection
+ultralytics==8.2.27
+torch>=2.1.0
+torchvision>=0.16.0
+
+# Tracking + Annotation
+supervision==0.21.0
+
+# Evaluation
+motmetrics==1.4.0
+
+# Image / Video
+opencv-python-headless>=4.9.0
+Pillow>=10.0.0
+
+# Data / Utils
+numpy>=1.26.0
+pandas>=2.0.0
+scipy>=1.10.0
+tqdm>=4.65.0
+PyYAML>=6.0
+
+# Visualization / Reporting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+rich>=13.0.0
+
+# Dev
+pytest>=7.4.0

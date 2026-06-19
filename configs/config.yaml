@@ -1,0 +1,70 @@
+# ─────────────────────────────────────────────
+# KITTI Vehicle Tracker — Pipeline Configuration
+# ─────────────────────────────────────────────
+
+# ── Paths ────────────────────────────────────
+paths:
+  kitti_root: "data/kitti"               # root of KITTI tracking dataset
+  sequences_dir: "data/kitti/training/image_02"
+  labels_dir: "data/kitti/training/label_02"
+  calib_dir: "data/kitti/training/calib"
+  output_dir: "outputs"
+  checkpoints_dir: "checkpoints"
+  demo_video: "outputs/tracking_demo.mp4"
+  results_csv: "outputs/mota_results.csv"
+
+# ── Dataset ──────────────────────────────────
+dataset:
+  sequences: null          # null = use all; or list e.g. [0, 1, 2]
+  eval_sequences: [0, 1, 2, 3, 4]   # sequences used for MOTA evaluation
+  img_size: 1280           # inference resolution (keeps KITTI aspect)
+  class_names:
+    - Car
+    - Pedestrian
+    - Cyclist
+  # KITTI label → COCO index mapping for YOLOv8 pretrained head
+  kitti_to_coco:
+    Car: 2          # car
+    Pedestrian: 0   # person
+    Cyclist: 1      # bicycle  (closest match)
+
+# ── Detection ────────────────────────────────
+detection:
+  model: "yolov8m.pt"          # m = good accuracy/speed tradeoff
+  conf_threshold: 0.25
+  iou_threshold: 0.45
+  device: "auto"               # auto = cuda if available, else cpu
+  half_precision: true         # FP16 on GPU
+  batch_size: 1                # frame-by-frame for tracking
+
+# ── Tracking (ByteTrack via supervision) ─────
+tracking:
+  tracker: "bytetrack"
+  track_thresh: 0.25           # high-score detection threshold
+  match_thresh: 0.8            # IoU match threshold
+  track_buffer: 30             # frames to keep lost tracks
+  frame_rate: 10               # KITTI training sequences are 10 fps
+
+# ── Evaluation ───────────────────────────────
+evaluation:
+  iou_threshold: 0.5           # IoU for TP/FP split (KITTI standard)
+  classes:
+    - Car
+    - Pedestrian
+    - Cyclist
+  min_height: 25               # minimum box height in pixels (KITTI filter)
+  max_occlusion: 2             # 0=fully visible, 1=partly, 2=largely occluded
+  max_truncation: 0.5
+
+# ── Visualization ─────────────────────────────
+visualization:
+  fps: 10
+  draw_tracks: true
+  track_history_len: 30        # frames of trail to draw
+  box_thickness: 2
+  font_scale: 0.6
+  class_colors:
+    Car:        [0,   200, 100]    # green
+    Pedestrian: [50,  150, 255]    # blue
+    Cyclist:    [255, 150,  50]    # orange
+    default:    [180, 180, 180]
