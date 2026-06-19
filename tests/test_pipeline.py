@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import pytest
 
-from src.data_loader import KITTIBox, parse_label_file
+from src.data_loader import KITTIBox, parse_dontcare_regions, parse_label_file
 from src.evaluator import MOTAEvaluator, _iou_matrix
 
 
@@ -166,6 +166,43 @@ class TestParseLabelFile:
         assert set(frames.keys()) == {0, 1, 2, 3, 4}
 
 
+class TestParseDontCareRegions:
+    def _write_label(self, tmp_path: Path, lines: list) -> Path:
+        p = tmp_path / "0000.txt"
+        p.write_text("\n".join(lines))
+        return p
+
+    def test_extracts_dontcare(self, tmp_path):
+        lines = [
+            "0 1 Car 0.0 0 0.0 0 0 100 100 1 1 1 0 0 0 0",
+            "0 -1 DontCare -1 -1 -10 490 490 550 540 -1 -1 -1 -1 -1 -1 -1",
+        ]
+        p = self._write_label(tmp_path, lines)
+        dontcare = parse_dontcare_regions(p)
+        assert 0 in dontcare
+        assert dontcare[0].shape == (1, 4)
+        np.testing.assert_array_almost_equal(dontcare[0][0], [490, 490, 550, 540])
+
+    def test_no_dontcare_in_file(self, tmp_path):
+        lines = ["0 1 Car 0.0 0 0.0 0 0 100 100 1 1 1 0 0 0 0"]
+        p = self._write_label(tmp_path, lines)
+        dontcare = parse_dontcare_regions(p)
+        assert dontcare == {}
+
+    def test_missing_file(self, tmp_path):
+        dontcare = parse_dontcare_regions(tmp_path / "nonexistent.txt")
+        assert dontcare == {}
+
+    def test_multiple_dontcare_same_frame(self, tmp_path):
+        lines = [
+            "0 -1 DontCare -1 -1 -10 0 0 50 50 -1 -1 -1 -1 -1 -1 -1",
+            "0 -1 DontCare -1 -1 -10 100 100 150 150 -1 -1 -1 -1 -1 -1 -1",
+        ]
+        p = self._write_label(tmp_path, lines)
+        dontcare = parse_dontcare_regions(p)
+        assert dontcare[0].shape == (2, 4)
+
+
 # ── MOTA Evaluator ────────────────────────────────────────────────────────────
 
 def _make_box(frame, tid, cls="Car", x1=0, y1=0, x2=100, y2=100):
@@ -243,6 +280,64 @@ class TestMOTAEvaluator:
         )
         df = evaluator.compute()
         assert df is not None
+
+    def test_dontcare_filtering_removes_false_positive(self):
+        """
+        A prediction overlapping a DontCare region should NOT be counted
+        as a false positive — per KITTI's official evaluation protocol.
+        """
+        evaluator = MOTAEvaluator(iou_threshold=0.5, classes=["Car"])
+
+        # One real GT car, perfectly matched
+        gt = [_make_box(0, 1, "Car", 0, 0, 100, 100)]
+
+        # Two predictions: one matches GT, one is a "background" detection
+        # that exactly overlaps a DontCare region (e.g. a distant unlabeled car)
+        pred_xyxy = np.array([
+            [0, 0, 100, 100],        # matches GT — true positive
+            [490, 490, 550, 540],    # exactly overlaps DontCare — should be excluded
+        ], dtype=np.float32)
+        pred_ids = np.array([10, 11])
+        pred_cls = np.array([0, 0])
+
+        dontcare = np.array([[490, 490, 550, 540]], dtype=np.float32)
+
+        evaluator.update(
+            frame_id=0, gt_boxes=gt,
+            pred_xyxy=pred_xyxy, pred_ids=pred_ids, pred_classes=pred_cls,
+            dontcare_xyxy=dontcare,
+        )
+
+        df = evaluator.compute()
+        # With DontCare filtering, FP should be 0 (only the matched box remains)
+        assert df.loc["All", "num_false_positives"] == 0
+        # MOTA should be high/perfect since the only "bad" prediction was excluded
+        assert df.loc["All", "mota"] >= 99.0
+
+    def test_dontcare_filtering_disabled_counts_fp(self):
+        """
+        Sanity check: WITHOUT dontcare_xyxy, the same background prediction
+        SHOULD be counted as a false positive — confirms the filter is
+        actually doing something, not just a no-op.
+        """
+        evaluator = MOTAEvaluator(iou_threshold=0.5, classes=["Car"])
+
+        gt = [_make_box(0, 1, "Car", 0, 0, 100, 100)]
+        pred_xyxy = np.array([
+            [0, 0, 100, 100],
+            [490, 490, 550, 540],
+        ], dtype=np.float32)
+        pred_ids = np.array([10, 11])
+        pred_cls = np.array([0, 0])
+
+        evaluator.update(
+            frame_id=0, gt_boxes=gt,
+            pred_xyxy=pred_xyxy, pred_ids=pred_ids, pred_classes=pred_cls,
+            dontcare_xyxy=None,   # no filtering
+        )
+
+        df = evaluator.compute()
+        assert df.loc["All", "num_false_positives"] == 1
 
 
 # ── Visualizer smoke test ─────────────────────────────────────────────────────
