@@ -196,6 +196,8 @@ class MOTAEvaluator:
         pred_xyxy: np.ndarray,
         pred_ids: np.ndarray,
         pred_classes: Optional[np.ndarray] = None,
+        dontcare_xyxy: Optional[np.ndarray] = None,
+        dontcare_iou_threshold: float = 0.5,
     ) -> None:
         """
         Record one frame's ground truth vs predictions.
@@ -208,17 +210,42 @@ class MOTAEvaluator:
         pred_ids    : (N,) integer track IDs.
         pred_classes: (N,) integer class IDs (0=Car,1=Ped,2=Cyc).
                       If None, all predictions treated as class-agnostic.
+        dontcare_xyxy : (M, 4) KITTI 'DontCare' region boxes for this frame.
+                      Per KITTI's official evaluation protocol, any
+                      prediction overlapping a DontCare region above
+                      `dontcare_iou_threshold` is excluded entirely — not
+                      counted as a false positive. These regions mark
+                      objects too distant/small/ambiguous to label, not
+                      "this isn't an object" — without this filter,
+                      correctly-detected background vehicles get unfairly
+                      penalized as FPs.
+        dontcare_iou_threshold : IoU threshold for the DontCare exclusion.
         """
         self._n_frames += 1
+
+        pred_xyxy = np.asarray(pred_xyxy, dtype=np.float32) \
+                    if pred_xyxy is not None and len(pred_xyxy) > 0 \
+                    else np.zeros((0, 4), dtype=np.float32)
+        pred_ids = np.asarray(pred_ids) if pred_ids is not None else np.array([], dtype=int)
+        pred_classes = np.asarray(pred_classes) if pred_classes is not None else None
+
+        # ── Filter out predictions overlapping DontCare regions ───────────────
+        if dontcare_xyxy is not None and len(dontcare_xyxy) > 0 and len(pred_xyxy) > 0:
+            iou = _iou_matrix(np.asarray(dontcare_xyxy, dtype=np.float32), pred_xyxy)
+            max_iou_per_pred = iou.max(axis=0) if iou.shape[0] > 0 else np.zeros(len(pred_xyxy))
+            keep = max_iou_per_pred < dontcare_iou_threshold
+
+            pred_xyxy = pred_xyxy[keep]
+            pred_ids  = pred_ids[keep] if len(pred_ids) > 0 else pred_ids
+            if pred_classes is not None and len(pred_classes) > 0:
+                pred_classes = pred_classes[keep]
 
         # ── All-class combined ────────────────────────────────────────────────
         all_gt_ids   = [b.track_id for b in gt_boxes]
         all_gt_xyxy  = np.array([b.bbox_xyxy for b in gt_boxes], dtype=np.float32) \
                        if gt_boxes else np.zeros((0, 4), dtype=np.float32)
-        all_pred_ids = list(pred_ids) if pred_ids is not None and len(pred_ids) > 0 else []
-        all_pred_xyxy= np.asarray(pred_xyxy, dtype=np.float32) \
-                       if pred_xyxy is not None and len(pred_xyxy) > 0 \
-                       else np.zeros((0, 4), dtype=np.float32)
+        all_pred_ids = list(pred_ids) if len(pred_ids) > 0 else []
+        all_pred_xyxy= pred_xyxy
 
         self._accs["All"].update(
             all_gt_ids, all_gt_xyxy, all_pred_ids, all_pred_xyxy
