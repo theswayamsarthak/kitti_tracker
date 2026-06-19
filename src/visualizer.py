@@ -10,7 +10,8 @@ Features
 - Confidence scores
 - Trajectory trail (centroid history)
 - Frame counter + sequence info overlay
-- Writes MP4 via OpenCV VideoWriter (H.264 / XVID fallback)
+- Writes MP4 via ffmpeg muxing (guaranteed browser-compatible H.264),
+  with automatic fallback to cv2.VideoWriter if ffmpeg is unavailable
 """
 
 from __future__ import annotations
@@ -49,26 +50,12 @@ def _track_color(track_id: int) -> Tuple[int, int, int]:
     return _TRACK_PALETTE[track_id % len(_TRACK_PALETTE)]
 
 
-# ── VideoWriter factory ───────────────────────────────────────────────────────
+# ── ffmpeg availability check ─────────────────────────────────────────────────
 
-def _make_writer(
-    out_path: Path,
-    fps: float,
-    frame_size: Tuple[int, int],   # (W, H)
-) -> cv2.VideoWriter:
-    """Try H.264 first, fall back to XVID."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for fourcc_str in ("avc1", "mp4v", "XVID"):
-        fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
-        writer = cv2.VideoWriter(
-            str(out_path), fourcc, fps, frame_size
-        )
-        if writer.isOpened():
-            logger.info(f"VideoWriter opened with codec '{fourcc_str}'")
-            return writer
-
-    raise RuntimeError(f"Could not open VideoWriter for {out_path}")
+def _ffmpeg_available() -> bool:
+    """Check if the ffmpeg binary is on PATH."""
+    import shutil as _shutil
+    return _shutil.which("ffmpeg") is not None
 
 
 # ── Core drawing helpers ──────────────────────────────────────────────────────
@@ -223,7 +210,23 @@ class FrameAnnotator:
 
 class TrackingVideoWriter:
     """
-    Context-managed MP4 writer.
+    Context-managed MP4 writer that guarantees browser-playable output.
+
+    Why this exists
+    ────────────────
+    cv2.VideoWriter's H.264 support depends on how OpenCV was compiled.
+    `opencv-python-headless` (used in this project) often lacks a working
+    H.264 encoder, silently falling back to 'mp4v' — which plays fine in
+    VLC/most desktop players but many BROWSERS (including Colab's inline
+    <video> preview) cannot decode mp4v at all, showing a blank/broken player.
+
+    Fix: write each annotated frame as a JPEG to a temp directory, then mux
+    the full sequence into H.264 MP4 via the ffmpeg CLI binary at the end.
+    ffmpeg ships preinstalled on both Colab and Kaggle, so this requires no
+    extra dependency and guarantees a real H.264 file every time.
+
+    Falls back to cv2.VideoWriter (mp4v) only if ffmpeg is unavailable,
+    with a logged warning that the output may not preview in-browser.
 
     Usage
     -----
@@ -234,23 +237,104 @@ class TrackingVideoWriter:
             annotated = annotator.annotate(image, tracks.detections,
                                            tracks.histories, frame_id, "0000")
             vw.write(annotated)
+    # H.264 MP4 is muxed and temp frames cleaned up on __exit__
     """
 
     def __init__(self, out_path: str | Path, fps: float = 10.0):
         self.out_path = Path(out_path)
         self.fps      = fps
-        self._writer: Optional[cv2.VideoWriter] = None
+
+        self._use_ffmpeg   = _ffmpeg_available()
+        self._frame_count   = 0
+        self._tmp_dir: Optional[Path] = None
+        self._cv2_writer: Optional[cv2.VideoWriter] = None
+
+        if self._use_ffmpeg:
+            logger.info("ffmpeg found — will mux frames to H.264 MP4 (browser-compatible)")
+        else:
+            logger.warning(
+                "ffmpeg not found on PATH — falling back to cv2.VideoWriter (mp4v). "
+                "Output may not preview inline in browsers; install ffmpeg for "
+                "guaranteed compatibility."
+            )
 
     def write(self, frame: np.ndarray) -> None:
-        h, w = frame.shape[:2]
-        if self._writer is None:
-            self._writer = _make_writer(self.out_path, self.fps, (w, h))
-        self._writer.write(frame)
+        if self._use_ffmpeg:
+            self._write_frame_jpeg(frame)
+        else:
+            self._write_frame_cv2(frame)
+        self._frame_count += 1
+
+    # ── ffmpeg path ──────────────────────────────────────────────────────────
+
+    def _write_frame_jpeg(self, frame: np.ndarray) -> None:
+        import tempfile
+        if self._tmp_dir is None:
+            self._tmp_dir = Path(tempfile.mkdtemp(prefix="kitti_frames_"))
+        frame_path = self._tmp_dir / f"frame_{self._frame_count:06d}.jpg"
+        cv2.imwrite(str(frame_path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+    def _mux_with_ffmpeg(self) -> None:
+        import subprocess
+
+        if self._tmp_dir is None or self._frame_count == 0:
+            logger.warning("No frames written — skipping video mux")
+            return
+
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(self.fps),
+            "-i", str(self._tmp_dir / "frame_%06d.jpg"),
+            "-vcodec", "libx264",
+            "-pix_fmt", "yuv420p",     # required for broad browser/player support
+            "-movflags", "+faststart", # allows playback to start before full download
+            str(self.out_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logger.error(f"ffmpeg muxing failed:\n{result.stderr[-2000:]}")
+            raise RuntimeError(
+                f"ffmpeg failed to mux video at {self.out_path}. "
+                f"stderr: {result.stderr[-500:]}"
+            )
+
+        logger.info(
+            f"Muxed {self._frame_count} frames → {self.out_path} "
+            f"({self.out_path.stat().st_size / 1e6:.1f} MB)"
+        )
+
+    # ── cv2 fallback path ────────────────────────────────────────────────────
+
+    def _write_frame_cv2(self, frame: np.ndarray) -> None:
+        if self._cv2_writer is None:
+            h, w = frame.shape[:2]
+            self.out_path.parent.mkdir(parents=True, exist_ok=True)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self._cv2_writer = cv2.VideoWriter(str(self.out_path), fourcc, self.fps, (w, h))
+            if not self._cv2_writer.isOpened():
+                raise RuntimeError(f"Could not open cv2.VideoWriter for {self.out_path}")
+        self._cv2_writer.write(frame)
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
 
     def release(self) -> None:
-        if self._writer is not None:
-            self._writer.release()
-            self._writer = None
+        if self._use_ffmpeg:
+            try:
+                self._mux_with_ffmpeg()
+            finally:
+                self._cleanup_tmp_dir()
+        elif self._cv2_writer is not None:
+            self._cv2_writer.release()
+            self._cv2_writer = None
+
+    def _cleanup_tmp_dir(self) -> None:
+        if self._tmp_dir is not None and self._tmp_dir.exists():
+            import shutil as _shutil
+            _shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            self._tmp_dir = None
 
     def __enter__(self) -> "TrackingVideoWriter":
         return self
