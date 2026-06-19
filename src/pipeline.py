@@ -125,6 +125,7 @@ def run_sequence(
                     pred_xyxy=pred_xyxy,
                     pred_ids=pred_ids,
                     pred_classes=pred_cls,
+                    dontcare_xyxy=sequence.get_dontcare(frame_id),
                 )
 
             # ── Visualize ─────────────────────────────────────────────────
