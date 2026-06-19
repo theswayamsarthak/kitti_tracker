@@ -84,6 +84,46 @@ class SequenceInfo:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
+def parse_dontcare_regions(label_path: Path) -> Dict[int, np.ndarray]:
+    """
+    Parse 'DontCare' regions from a KITTI label file.
+
+    KITTI's official evaluation protocol excludes any prediction that
+    overlaps a DontCare region from being counted as a false positive —
+    these are objects too distant/small/ambiguous to label reliably, NOT
+    "this isn't an object." Without this filter, detectors that correctly
+    spot background vehicles get unfairly penalized.
+
+    Returns
+    -------
+    Dict[int, np.ndarray]
+        frame_id -> (N, 4) array of [x1, y1, x2, y2] DontCare boxes.
+        Frames with no DontCare regions are simply absent from the dict.
+    """
+    frames: Dict[int, List[List[float]]] = {}
+
+    if not label_path.exists():
+        return {}
+
+    with label_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 10 or parts[2] != "DontCare":
+                continue
+
+            frame = int(parts[0])
+            x1, y1, x2, y2 = float(parts[6]), float(parts[7]), float(parts[8]), float(parts[9])
+            frames.setdefault(frame, []).append([x1, y1, x2, y2])
+
+    return {
+        frame_id: np.array(boxes, dtype=np.float32)
+        for frame_id, boxes in frames.items()
+    }
+
+
 def parse_label_file(
     label_path: Path,
     allowed_classes: Optional[List[str]] = None,
@@ -208,6 +248,11 @@ class KITTISequence:
             max_truncation=max_truncation,
         )
 
+        # Parse DontCare regions — used by the evaluator to exclude
+        # predictions on legitimately-unlabeled background objects from
+        # being counted as false positives (KITTI's official protocol).
+        self.dontcare: Dict[int, np.ndarray] = parse_dontcare_regions(self.label_path)
+
         # Cache image shape from first frame
         _img0 = cv2.imread(str(self._frames[0]))
         self.image_shape: Tuple[int, int, int] = _img0.shape  # (H, W, C)
@@ -226,6 +271,10 @@ class KITTISequence:
             n_frames=self.n_frames,
             image_shape=self.image_shape,
         )
+
+    def get_dontcare(self, frame_id: int) -> np.ndarray:
+        """Return (N, 4) xyxy DontCare boxes for a frame, or empty (0,4) array."""
+        return self.dontcare.get(frame_id, np.zeros((0, 4), dtype=np.float32))
 
     def __len__(self) -> int:
         return self.n_frames
