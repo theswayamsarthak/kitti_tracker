@@ -51,6 +51,17 @@ class KITTIDetector:
     device          : "cpu", "cuda", "cuda:0", or "auto".
     half_precision  : Use FP16 on GPU if True.
     img_size        : Inference resolution (keeps aspect ratio).
+    agnostic_nms    : If True, NMS suppresses overlapping boxes regardless
+                      of predicted class. REQUIRED here because we remap
+                      multiple COCO classes (car/bus/truck) onto a single
+                      KITTI class (Car) — without this, YOLO's default
+                      per-class NMS can let two overlapping boxes survive
+                      (e.g. one labeled 'car', one labeled 'truck', for the
+                      SAME physical vehicle) since they were different
+                      classes at NMS time. After remapping, both become
+                      "Car" detections on the same object — one is now a
+                      guaranteed false positive. This single fix matters a
+                      lot for KITTI's vehicle classes specifically.
     """
 
     def __init__(
@@ -61,17 +72,19 @@ class KITTIDetector:
         device: str = "auto",
         half_precision: bool = True,
         img_size: int = 1280,
+        agnostic_nms: bool = True,
     ):
         import torch
 
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.device     = device
-        self.conf       = conf_threshold
-        self.iou        = iou_threshold
-        self.img_size   = img_size
-        self.half       = half_precision and (device != "cpu")
+        self.device       = device
+        self.conf         = conf_threshold
+        self.iou          = iou_threshold
+        self.img_size     = img_size
+        self.half         = half_precision and (device != "cpu")
+        self.agnostic_nms = agnostic_nms
 
         self.model = YOLO(str(model_path))
 
@@ -108,6 +121,7 @@ class KITTIDetector:
             imgsz=self.img_size,
             device=self.device,
             half=self.half,
+            agnostic_nms=self.agnostic_nms,
             verbose=False,
         )
 
