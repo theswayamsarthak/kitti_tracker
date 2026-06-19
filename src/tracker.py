@@ -58,7 +58,7 @@ class KITTITracker:
     """
     Stateful ByteTrack wrapper.
 
-    Wraps supervision.ByteTracker and adds:
+    Wraps supervision.ByteTrack and adds:
       - Per-track class identity (majority vote across frames)
       - Trajectory history (centroid trail)
       - Clean reset between sequences
@@ -91,8 +91,8 @@ class KITTITracker:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def _init_tracker(self) -> None:
-        """(Re-)initialise a fresh ByteTracker instance."""
-        self._tracker = sv.ByteTracker(
+        """(Re-)initialise a fresh ByteTrack instance."""
+        self._tracker = sv.ByteTrack(
             track_activation_threshold=self.track_thresh,
             lost_track_buffer=self.track_buffer,
             minimum_matching_threshold=self.match_thresh,
@@ -135,7 +135,7 @@ class KITTITracker:
                 frame_id=frame_id,
             )
 
-        # ByteTracker.update returns sv.Detections with tracker_id filled in
+        # ByteTrack.update returns sv.Detections with tracker_id filled in
         tracked: sv.Detections = self._tracker.update_with_detections(detections)
 
         if tracked.tracker_id is None or len(tracked) == 0:
