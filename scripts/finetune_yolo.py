@@ -17,6 +17,18 @@ python scripts/finetune_yolo.py \
     --imgsz 1280 \
     --batch 16 \
     --device 0
+
+To RESUME interrupted training (e.g. after a disconnect):
+python scripts/finetune_yolo.py \
+    --resume \
+    --model runs/finetune/kitti_yolo/weights/last.pt \
+    --output-checkpoint checkpoints/kitti_finetuned.pt
+
+Note: when --resume is set, Ultralytics reads the ORIGINAL run's saved
+training config (data/epochs/imgsz/etc.) from that run's args.yaml — you
+do NOT need to re-specify --data/--epochs/etc., and any you do pass are
+ignored by Ultralytics' resume logic except --model (which must point at
+the last.pt to resume from).
 """
 
 from __future__ import annotations
@@ -33,10 +45,12 @@ console = Console()
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Fine-tune YOLO on KITTI")
-    p.add_argument("--data", type=Path, required=True,
-                   help="Path to dataset.yaml from convert_kitti_to_yolo.py")
+    p.add_argument("--data", type=Path, default=None,
+                   help="Path to dataset.yaml from convert_kitti_to_yolo.py "
+                        "(not required when --resume is set)")
     p.add_argument("--model", default="yolo26m.pt",
-                   help="Base pretrained checkpoint to fine-tune from")
+                   help="Base pretrained checkpoint to fine-tune from, OR "
+                        "(with --resume) the path to a last.pt to resume from")
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--batch", type=int, default=16)
@@ -48,39 +62,59 @@ def main() -> None:
     p.add_argument("--name", default="kitti_yolo")
     p.add_argument("--output-checkpoint", type=Path, default=Path("checkpoints/kitti_finetuned.pt"),
                    help="Where to copy the best checkpoint after training")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume interrupted training from --model (a last.pt checkpoint). "
+                        "Ultralytics restores the original run's config automatically.")
     args = p.parse_args()
 
-    if not args.data.exists():
-        raise FileNotFoundError(
-            f"{args.data} not found — run scripts/convert_kitti_to_yolo.py first"
+    if args.resume:
+        console.print(f"[bold]Resuming training from {args.model}[/]")
+        if not Path(args.model).exists():
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.model}")
+
+        model = YOLO(args.model)
+        results = model.train(resume=True)
+
+        # Ultralytics keeps the ORIGINAL project/name from the resumed run —
+        # locate it via the model's own trainer save_dir rather than args.project,
+        # since resume may have happened under a different --project path.
+        best_ckpt = Path(model.trainer.save_dir) / "weights" / "best.pt"
+
+    else:
+        if args.data is None:
+            raise ValueError("--data is required unless --resume is set")
+        if not args.data.exists():
+            raise FileNotFoundError(
+                f"{args.data} not found — run scripts/convert_kitti_to_yolo.py first"
+            )
+
+        console.print(f"[bold]Fine-tuning {args.model} on {args.data}[/]")
+        console.print(f"  Epochs: {args.epochs}  ImgSize: {args.imgsz}  Batch: {args.batch}  Device: {args.device}")
+
+        model = YOLO(args.model)
+
+        results = model.train(
+            data=str(args.data),
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            device=args.device,
+            patience=args.patience,
+            project=str(args.project),
+            name=args.name,
+            exist_ok=True,
+            # KITTI-relevant augmentation tweaks — vehicles in dashcam footage
+            # don't appear upside-down or heavily rotated, so we tone down
+            # augmentations that don't reflect this domain's real variation.
+            degrees=0.0,        # no rotation augmentation
+            flipud=0.0,         # no vertical flip — cars are never upside down
+            fliplr=0.5,         # horizontal flip is fine (mirrored street scenes)
+            mosaic=1.0,         # keep mosaic — helps with small/distant objects
         )
 
-    console.print(f"[bold]Fine-tuning {args.model} on {args.data}[/]")
-    console.print(f"  Epochs: {args.epochs}  ImgSize: {args.imgsz}  Batch: {args.batch}  Device: {args.device}")
-
-    model = YOLO(args.model)
-
-    results = model.train(
-        data=str(args.data),
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        device=args.device,
-        patience=args.patience,
-        project=str(args.project),
-        name=args.name,
-        exist_ok=True,
-        # KITTI-relevant augmentation tweaks — vehicles in dashcam footage
-        # don't appear upside-down or heavily rotated, so we tone down
-        # augmentations that don't reflect this domain's real variation.
-        degrees=0.0,        # no rotation augmentation
-        flipud=0.0,         # no vertical flip — cars are never upside down
-        fliplr=0.5,         # horizontal flip is fine (mirrored street scenes)
-        mosaic=1.0,         # keep mosaic — helps with small/distant objects
-    )
+        best_ckpt = args.project / args.name / "weights" / "best.pt"
 
     # Locate best checkpoint
-    best_ckpt = args.project / args.name / "weights" / "best.pt"
     if not best_ckpt.exists():
         raise FileNotFoundError(f"Expected checkpoint not found: {best_ckpt}")
 
