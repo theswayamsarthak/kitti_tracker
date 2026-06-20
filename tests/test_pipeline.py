@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import numpy as np
 import pytest
 
-from src.data_loader import KITTIBox, parse_dontcare_regions, parse_label_file
+from src.data_loader import KITTIBox, parse_dontcare_regions, parse_ignore_regions, parse_label_file
 from src.evaluator import MOTAEvaluator, _iou_matrix
 
 
@@ -201,6 +201,46 @@ class TestParseDontCareRegions:
         p = self._write_label(tmp_path, lines)
         dontcare = parse_dontcare_regions(p)
         assert dontcare[0].shape == (2, 4)
+
+
+class TestParseIgnoreRegions:
+    """parse_ignore_regions generalizes DontCare to also catch Van/Truck/etc."""
+
+    def _write_label(self, tmp_path: Path, lines: list) -> Path:
+        p = tmp_path / "0000.txt"
+        p.write_text("\n".join(lines))
+        return p
+
+    def test_van_is_ignored_not_evaluated(self, tmp_path):
+        """A Van GT box should appear in ignore regions when allowed_classes
+        is restricted to Car/Pedestrian/Cyclist — fixing the bug where a
+        correctly-detected van became a guaranteed false positive."""
+        lines = [
+            "0 1 Car 0.0 0 0.0 0 0 100 100 1 1 1 0 0 0 0",
+            "0 2 Van 0.0 0 0.0 200 200 300 300 1 1 1 0 0 0 0",
+        ]
+        p = self._write_label(tmp_path, lines)
+        ignore = parse_ignore_regions(p, allowed_classes=["Car", "Pedestrian", "Cyclist"])
+        assert 0 in ignore
+        assert ignore[0].shape == (1, 4)
+        np.testing.assert_array_almost_equal(ignore[0][0], [200, 200, 300, 300])
+
+    def test_dontcare_and_van_both_ignored(self, tmp_path):
+        lines = [
+            "0 -1 DontCare -1 -1 -10 0 0 50 50 -1 -1 -1 -1 -1 -1 -1",
+            "0 2 Truck 0.0 0 0.0 200 200 300 300 1 1 1 0 0 0 0",
+        ]
+        p = self._write_label(tmp_path, lines)
+        ignore = parse_ignore_regions(p, allowed_classes=["Car", "Pedestrian", "Cyclist"])
+        assert ignore[0].shape == (2, 4)
+
+    def test_car_not_in_ignore_regions(self, tmp_path):
+        """Sanity check: a normal Car GT box should NOT show up as an
+        ignore region — only non-evaluated classes should."""
+        lines = ["0 1 Car 0.0 0 0.0 0 0 100 100 1 1 1 0 0 0 0"]
+        p = self._write_label(tmp_path, lines)
+        ignore = parse_ignore_regions(p, allowed_classes=["Car", "Pedestrian", "Cyclist"])
+        assert ignore == {}
 
 
 # ── MOTA Evaluator ────────────────────────────────────────────────────────────
