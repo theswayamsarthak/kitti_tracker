@@ -418,5 +418,84 @@ class TestFrameAnnotator:
         assert not np.all(result == 0)
 
 
+from unittest.mock import MagicMock, patch
+
+
+class TestKITTIDetectorFinetunedMode:
+    """
+    Tests the finetuned=True code path using a mocked Ultralytics model —
+    no actual model download/inference needed, just verifying the
+    class-id passthrough logic (no COCO remap) is correct.
+    """
+
+    def _make_detector_with_mock(self, finetuned: bool):
+        from src.detector import KITTIDetector
+
+        with patch("src.detector.YOLO") as mock_yolo_cls:
+            mock_model = MagicMock()
+            mock_yolo_cls.return_value = mock_model
+            detector = KITTIDetector(
+                model_path="fake.pt",
+                device="cpu",
+                finetuned=finetuned,
+            )
+            return detector, mock_model
+
+    def test_finetuned_mode_skips_coco_remap(self):
+        """In finetuned mode, raw model class ids should pass through
+        UNCHANGED — no COCO→KITTI remapping applied."""
+        detector, mock_model = self._make_detector_with_mock(finetuned=True)
+
+        # Simulate YOLO output: 2 boxes, raw class ids 1 and 2
+        # (these would be WRONG if COCO-remapped, since COCO id 1=bicycle
+        # would incorrectly become Cyclist; but in finetuned mode, id 1
+        # IS already "Pedestrian" by our own training convention)
+        mock_boxes = MagicMock()
+        mock_boxes.__len__ = lambda self: 2
+        mock_boxes.xyxy.cpu.return_value.numpy.return_value = np.array(
+            [[0, 0, 50, 50], [60, 60, 100, 100]], dtype=np.float32
+        )
+        mock_boxes.conf.cpu.return_value.numpy.return_value = np.array([0.9, 0.8], dtype=np.float32)
+        mock_boxes.cls.cpu.return_value.numpy.return_value = np.array([1, 2])
+
+        mock_result = MagicMock()
+        mock_result.boxes = mock_boxes
+        mock_model.predict.return_value = [mock_result]
+
+        detections = detector.detect(np.zeros((375, 1242, 3), dtype=np.uint8))
+
+        # Class ids should pass through exactly as-is: [1, 2]
+        np.testing.assert_array_equal(detections.class_id, [1, 2])
+
+    def test_finetuned_mode_passes_classes_none_to_predict(self):
+        """Fine-tuned models only have 3 classes — the `classes` filter
+        param should be None (no COCO-class filtering applied)."""
+        detector, mock_model = self._make_detector_with_mock(finetuned=True)
+
+        mock_result = MagicMock()
+        mock_result.boxes = None
+        mock_model.predict.return_value = [mock_result]
+
+        detector.detect(np.zeros((375, 1242, 3), dtype=np.uint8))
+
+        _, kwargs = mock_model.predict.call_args
+        assert kwargs["classes"] is None
+
+    def test_coco_pretrained_mode_still_filters_classes(self):
+        """Sanity check: default (finetuned=False) mode should still pass
+        the COCO class filter — confirms the two modes are distinct."""
+        detector, mock_model = self._make_detector_with_mock(finetuned=False)
+
+        mock_result = MagicMock()
+        mock_result.boxes = None
+        mock_model.predict.return_value = [mock_result]
+
+        detector.detect(np.zeros((375, 1242, 3), dtype=np.uint8))
+
+        _, kwargs = mock_model.predict.call_args
+        assert kwargs["classes"] is not None
+        assert isinstance(kwargs["classes"], list)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
