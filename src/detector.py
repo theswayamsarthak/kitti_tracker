@@ -1,10 +1,16 @@
 """
 src/detector.py
 ───────────────
-YOLOv8-based frame detector for KITTI classes.
+YOLO-based frame detector for KITTI classes.
 
-Maps COCO class indices → KITTI class names so the rest of the
-pipeline always works with {"Car", "Pedestrian", "Cyclist"} labels.
+Supports two modes:
+  1. COCO-pretrained (default): maps COCO class indices -> KITTI class
+     names (Car/Pedestrian/Cyclist) since the model never saw KITTI's
+     actual labels.
+  2. Fine-tuned (finetuned=True): the model was trained directly on KITTI
+     data via scripts/convert_kitti_to_yolo.py + scripts/finetune_yolo.py,
+     so it already outputs class ids 0=Car, 1=Pedestrian, 2=Cyclist
+     natively — no remapping needed, used as-is.
 
 Detection output is returned as supervision.Detections so it plugs
 directly into the ByteTrack tracker without extra conversion.
@@ -21,7 +27,8 @@ from ultralytics import YOLO
 
 
 # ── COCO → KITTI mapping ──────────────────────────────────────────────────────
-# YOLOv8 pretrained on COCO; we remap the relevant classes.
+# Only used when finetuned=False (default). YOLOv8/11/26 pretrained on COCO;
+# we remap the relevant classes onto KITTI's 3 evaluated classes.
 # COCO ids: person=0, bicycle=1, car=2, motorbike=3, bus=5, truck=7
 _COCO_TO_KITTI: Dict[int, str] = {
     0: "Pedestrian",
@@ -38,41 +45,49 @@ _KITTI_CLASSES = ["Car", "Pedestrian", "Cyclist"]
 class KITTIDetector:
     """
     Thin wrapper around Ultralytics YOLO that:
-      - filters to vehicle-relevant COCO classes
-      - maps them to KITTI class names
+      - filters to vehicle-relevant classes
+      - maps them to KITTI class names (COCO-pretrained mode only)
       - returns supervision.Detections
 
     Parameters
     ----------
-    model_path      : Path to .pt weights (e.g. "yolov8m.pt").
-                      If the file does not exist, Ultralytics downloads it.
+    model_path      : Path to .pt weights. For COCO-pretrained mode, e.g.
+                      "yolo26m.pt" (auto-downloaded). For fine-tuned mode,
+                      the path to your checkpoint from
+                      scripts/finetune_yolo.py (e.g.
+                      "checkpoints/kitti_finetuned.pt").
     conf_threshold  : Minimum detection confidence (0–1).
     iou_threshold   : NMS IoU threshold (0–1).
     device          : "cpu", "cuda", "cuda:0", or "auto".
     half_precision  : Use FP16 on GPU if True.
     img_size        : Inference resolution (keeps aspect ratio).
     agnostic_nms    : If True, NMS suppresses overlapping boxes regardless
-                      of predicted class. REQUIRED here because we remap
-                      multiple COCO classes (car/bus/truck) onto a single
-                      KITTI class (Car) — without this, YOLO's default
-                      per-class NMS can let two overlapping boxes survive
-                      (e.g. one labeled 'car', one labeled 'truck', for the
-                      SAME physical vehicle) since they were different
-                      classes at NMS time. After remapping, both become
-                      "Car" detections on the same object — one is now a
-                      guaranteed false positive. This single fix matters a
-                      lot for KITTI's vehicle classes specifically.
+                      of predicted class. REQUIRED in COCO-pretrained mode
+                      because we remap multiple COCO classes (car/bus/truck)
+                      onto a single KITTI class (Car) — without this,
+                      YOLO's default per-class NMS can let two overlapping
+                      boxes survive (e.g. one labeled 'car', one labeled
+                      'truck', for the SAME physical vehicle) since they
+                      were different classes at NMS time. Also left on by
+                      default for fine-tuned mode — harmless there since
+                      the model's classes are already mutually exclusive,
+                      but doesn't hurt.
+    finetuned       : If True, skip COCO→KITTI remapping entirely. Assumes
+                      the model was trained via convert_kitti_to_yolo.py,
+                      which fixes class ids as 0=Car, 1=Pedestrian,
+                      2=Cyclist — output is used directly.
     """
 
     def __init__(
         self,
-        model_path: str | Path = "yolov8m.pt",
+        model_path: str | Path = "yolo26m.pt",
         conf_threshold: float = 0.25,
         iou_threshold: float  = 0.45,
         device: str = "auto",
         half_precision: bool = True,
         img_size: int = 1280,
         agnostic_nms: bool = True,
+        finetuned: bool = False,
     ):
         import torch
 
@@ -85,14 +100,16 @@ class KITTIDetector:
         self.img_size     = img_size
         self.half         = half_precision and (device != "cpu")
         self.agnostic_nms = agnostic_nms
+        self.finetuned    = finetuned
 
         self.model = YOLO(str(model_path))
 
         # Class label array used by supervision (index → name)
-        # We use a tiny subset; supervision only needs it for visualisation
         self._class_names = np.array(_KITTI_CLASSES)
 
-        # COCO indices we care about (passed to YOLO for early filtering)
+        # COCO indices we care about — only relevant in COCO-pretrained mode.
+        # In fine-tuned mode, `classes` filter is omitted entirely (model
+        # only has 3 classes anyway, all of which we want).
         self._coco_classes = list(_COCO_TO_KITTI.keys())
 
         # class name → stable integer id for supervision
@@ -117,7 +134,7 @@ class KITTIDetector:
             source=frame,
             conf=self.conf,
             iou=self.iou,
-            classes=self._coco_classes,
+            classes=None if self.finetuned else self._coco_classes,
             imgsz=self.img_size,
             device=self.device,
             half=self.half,
@@ -132,16 +149,24 @@ class KITTIDetector:
 
         boxes_xyxy  = result.boxes.xyxy.cpu().numpy().astype(np.float32)
         confidences = result.boxes.conf.cpu().numpy().astype(np.float32)
-        coco_ids    = result.boxes.cls.cpu().numpy().astype(int)
+        raw_ids     = result.boxes.cls.cpu().numpy().astype(int)
 
-        # Map COCO → KITTI, drop unknowns
+        if self.finetuned:
+            # Model already outputs KITTI class ids directly — no remap.
+            return sv.Detections(
+                xyxy=boxes_xyxy,
+                confidence=confidences,
+                class_id=raw_ids,
+            )
+
+        # ── COCO-pretrained mode: map COCO → KITTI, drop unknowns ──────────
         kitti_ids   = np.array(
-            [self._kitti_class_id[_COCO_TO_KITTI[c]] for c in coco_ids
+            [self._kitti_class_id[_COCO_TO_KITTI[c]] for c in raw_ids
              if c in _COCO_TO_KITTI],
             dtype=int,
         )
         keep = np.array(
-            [i for i, c in enumerate(coco_ids) if c in _COCO_TO_KITTI],
+            [i for i, c in enumerate(raw_ids) if c in _COCO_TO_KITTI],
             dtype=int,
         )
 
