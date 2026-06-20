@@ -84,21 +84,78 @@ class SequenceInfo:
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
+def parse_ignore_regions(
+    label_path: Path,
+    allowed_classes: Optional[List[str]] = None,
+) -> Dict[int, np.ndarray]:
+    """
+    Parse all 'ignore' regions from a KITTI label file — i.e. every GT box
+    whose class is NOT in `allowed_classes`.
+
+    Why this matters
+    ─────────────────
+    KITTI labels several classes we don't explicitly evaluate: 'DontCare'
+    (deliberately unlabeled background), but also 'Van', 'Truck', 'Tram',
+    'Misc', 'Person_sitting'. If we only keep {Car, Pedestrian, Cyclist} in
+    ground truth, a real Van/Truck GT box is not "ignored" — it's silently
+    DELETED. A detector that correctly spots that van (mapped to our 'Car'
+    class) now has no matching GT box at all, so it gets scored as a false
+    positive despite being a genuinely correct detection.
+
+    This function returns the union of literal 'DontCare' boxes AND any
+    other-class box (Van, Truck, etc.) so the evaluator can exclude
+    predictions overlapping ANY of them — matching how most KITTI-based
+    work handles cross-class confusion between visually similar vehicle
+    categories.
+
+    Returns
+    -------
+    Dict[int, np.ndarray]
+        frame_id -> (N, 4) array of [x1, y1, x2, y2] ignore-region boxes.
+    """
+    if allowed_classes is None:
+        allowed_classes = ["Car", "Pedestrian", "Cyclist"]
+
+    frames: Dict[int, List[List[float]]] = {}
+
+    if not label_path.exists():
+        return {}
+
+    with label_path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+
+            cls = parts[2]
+            if cls in allowed_classes:
+                continue   # this is a normal evaluated box, not an ignore region
+
+            frame = int(parts[0])
+            x1, y1, x2, y2 = float(parts[6]), float(parts[7]), float(parts[8]), float(parts[9])
+            frames.setdefault(frame, []).append([x1, y1, x2, y2])
+
+    return {
+        frame_id: np.array(boxes, dtype=np.float32)
+        for frame_id, boxes in frames.items()
+    }
+
+
 def parse_dontcare_regions(label_path: Path) -> Dict[int, np.ndarray]:
     """
-    Parse 'DontCare' regions from a KITTI label file.
+    Parse ONLY literal 'DontCare' regions from a KITTI label file.
 
-    KITTI's official evaluation protocol excludes any prediction that
-    overlaps a DontCare region from being counted as a false positive —
-    these are objects too distant/small/ambiguous to label reliably, NOT
-    "this isn't an object." Without this filter, detectors that correctly
-    spot background vehicles get unfairly penalized.
+    Kept for backward compatibility / explicit DontCare-only use cases.
+    For full correctness, prefer `parse_ignore_regions()`, which also
+    excludes Van/Truck/Tram/etc. — see its docstring for why this matters.
 
     Returns
     -------
     Dict[int, np.ndarray]
         frame_id -> (N, 4) array of [x1, y1, x2, y2] DontCare boxes.
-        Frames with no DontCare regions are simply absent from the dict.
     """
     frames: Dict[int, List[List[float]]] = {}
 
@@ -248,10 +305,14 @@ class KITTISequence:
             max_truncation=max_truncation,
         )
 
-        # Parse DontCare regions — used by the evaluator to exclude
-        # predictions on legitimately-unlabeled background objects from
-        # being counted as false positives (KITTI's official protocol).
-        self.dontcare: Dict[int, np.ndarray] = parse_dontcare_regions(self.label_path)
+        # Parse ignore regions — DontCare PLUS any GT box whose class isn't
+        # in allowed_classes (e.g. Van/Truck when we only evaluate Car).
+        # Used by the evaluator to exclude predictions on these regions from
+        # being counted as false positives. See parse_ignore_regions() for
+        # the full rationale.
+        self.dontcare: Dict[int, np.ndarray] = parse_ignore_regions(
+            self.label_path, allowed_classes=allowed_classes
+        )
 
         # Cache image shape from first frame
         _img0 = cv2.imread(str(self._frames[0]))
